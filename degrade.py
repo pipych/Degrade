@@ -32,10 +32,12 @@ PROFILE = dict(
     gain_rgb=(0.93, 0.99, 1.07),   # холодный баланс белого (R,G,B)
     shadow_tint=(-2.0, 0.0, 5.0),  # синева в тенях
     saturation=1.02,
-    luma_noise=4.5,        # сигма яркостного шума (на шкале 0..255)
-    chroma_noise=2.0,      # сигма цветового шума
-    noise_shadow_boost=1.8,  # шум сильнее в тенях
-    noise_grain=0.7,       # радиус сглаживания шума (зерно, а не "соль")
+    nr_sigma=1.6,          # шумодав камеры: сила сглаживания плоских областей
+    nr_edge=14.0,          # порог границ (меньше -> больше "пластика")
+    luma_noise=1.6,        # сигма яркостного шума (на шкале 0..255)
+    chroma_noise=0.9,      # сигма цветового шума
+    noise_shadow_boost=2.5,  # шум заметнее в тенях, в светах почти нет
+    noise_grain=1.2,       # размер пятна шума (крупнее = мягче, естественнее)
     vignette=0.18,
     jpeg_quality=72,
     jpeg_passes=2,         # двойное пересжатие (как мессенджер)
@@ -51,8 +53,8 @@ def to_img(a):
     return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), "RGB")
 
 
-def blur_noise(n, radius):
-    """Сделать шум мелким зерном, а не пиксельной крупой."""
+def gauss(n, radius):
+    """Гауссово размытие float-массива HxWxC (separable)."""
     if radius <= 0:
         return n
     r = max(1, int(radius * 3))
@@ -60,8 +62,24 @@ def blur_noise(n, radius):
     k /= k.sum()
     pad = np.pad(n, ((r, r), (r, r), (0, 0)), mode="reflect")
     out = sum(k[i] * pad[i:i + n.shape[0]] for i in range(2 * r + 1))
-    out = sum(k[i] * out[:, i:i + n.shape[1]] for i in range(2 * r + 1))
+    return sum(k[i] * out[:, i:i + n.shape[1]] for i in range(2 * r + 1))
+
+
+def blur_noise(n, radius):
+    """Сделать шум мягкими пятнами, а не пиксельной крупой."""
+    out = gauss(n, radius)
     return out * (n.std() / (out.std() + 1e-6))  # вернуть амплитуду шума
+
+
+def denoise_smear(a, sigma, edge):
+    """Имитация шумодава дешёвой камеры: плоские области сглаживаются
+    в "пластик", границы остаются."""
+    lum = gauss(a.mean(2, keepdims=True), 1.0)
+    gy, gx = np.gradient(lum[..., 0])
+    g = np.hypot(gx, gy)[..., None]
+    w = np.clip(g / edge, 0, 1) ** 0.7          # 1 = край, 0 = плоско
+    w = gauss(w, 1.0)
+    return gauss(a, sigma) * (1 - w) + a * w
 
 
 def degrade(img, rng, s=1.0, p=PROFILE):
@@ -99,6 +117,10 @@ def degrade(img, rng, s=1.0, p=PROFILE):
     a = lum + (a - lum) * (1 + (p["saturation"] - 1) * s)
     a = np.clip(a, 0, 1) * 255.0
 
+    # 4b. шумодав камеры (замыливание текстуры кожи/стен)
+    if p["nr_sigma"] * s > 0:
+        a = denoise_smear(a, p["nr_sigma"] * s, p["nr_edge"])
+
     # 5. виньетка
     hh, ww = a.shape[:2]
     yy, xx = np.mgrid[0:hh, 0:ww].astype(np.float32)
@@ -107,7 +129,7 @@ def degrade(img, rng, s=1.0, p=PROFILE):
 
     # 6. шум: яркостной + цветовой, сильнее в тенях
     lum = a.mean(2, keepdims=True) / 255.0
-    amp = 1 + p["noise_shadow_boost"] * (1 - lum) ** 2
+    amp = 0.25 + p["noise_shadow_boost"] * (1 - lum) ** 2   # в светах почти чисто
     ln = rng.standard_normal((hh, ww, 1)).astype(np.float32)
     cn = rng.standard_normal((hh, ww, 3)).astype(np.float32)
     ln = blur_noise(np.repeat(ln, 3, 2), p["noise_grain"])[..., :1]
